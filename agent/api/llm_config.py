@@ -12,7 +12,7 @@ def get_llm(provider="gemini"):
     if provider == "gemini":
         # The LangChain wrapper of Gemini API
         return ChatGoogleGenerativeAI(
-            model="gemini-3.6-flash",
+            model="gemini-3.5-flash",
             temperature=0,
             api_key=os.getenv("GEMINI_API_KEY")
 
@@ -27,3 +27,10 @@ def get_llm(provider="gemini"):
         )
     else:
         raise ValueError("Invalid provider. Please choose either 'gemini' or 'groq'.")
+    
+
+def extract_text(response):
+    if isinstance(response.content, list):
+        return response.content[0]['text']
+    else:
+        return response.content
