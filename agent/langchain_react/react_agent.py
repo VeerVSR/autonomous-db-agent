@@ -1,58 +1,27 @@
-import os
-import sqlite3
-from dotenv import load_dotenv
-from langchain_groq import ChatGroq
-from langchain_core.tools import tool
-from langchain.agents import create_agent
+from database.db_manager import run_sql_query, get_schema_description
+from agent.api.llm_config import get_llm,extract_text
 
-from agent.langchain_react.prompt import system_prompt
+def build_initial_prompt(question,schema):
+    prompt = f""" You are a SQL Expert. Given the SQL Schema: {schema} Write one SQL query that answers this question: {question} Return ONLY the raw SQL query, nothing else — no explanation, no markdown formatting."""
+    return prompt
 
-load_dotenv()
-DB_PATH = "database/company.db"
+def build_correction_prompt(question,schema,failed_sql,error_message):
+    prompt = f""" You are a SQL expert, Given the sql error message: {error_message} and failed sql query : {failed_sql} , retry solving the same question : {question} Given the sql schema : {schema}"""
+    return prompt
 
-
-@tool
-def get_schema() -> str:
-    """Get the database tables and columns schema."""
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%';")
-    tables = cur.fetchall()
-    conn.close()
-    return "\n".join(t[0] for t in tables if t[0])
-
-
-@tool
-def run_query(query: str) -> str:
-    """Execute a SQL SELECT query against company.db and return rows or error."""
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    try:
-        cur.execute(query)
-        rows = cur.fetchall()
-        return str(rows)
-    except Exception as e:
-        return f"Error: {e}"
-    finally:
-        conn.close()
-
-
-llm = ChatGroq(
-    model="llama-3.3-70b-versatile",
-    temperature=0
-)
-
-agent = create_agent(
-    model=llm,
-    tools=[get_schema, run_query],
-    system_prompt=system_prompt
-)
-
-
-def run_agent(question: str) -> str:
-    response = agent.invoke({
-        "messages": [
-            {"role": "user", "content": question}
-        ]
-    })
-    return response["messages"][-1].content
+def answer_question(question , max_attempts = 4):
+    schema = get_schema_description()
+    prompt = build_initial_prompt(question,schema)
+    
+    attempts = 0 
+    while attempts<max_attempts:
+        attempts+=1
+        
+        llm = get_llm("gemini")
+        response = llm.invoke(prompt)
+        generated_sql = extract_text(response)
+        
+        result = run_sql_query(generated_sql)
+        get_llm()
+        run_sql_query()
+        extract_text()
