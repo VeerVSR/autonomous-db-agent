@@ -1,7 +1,13 @@
+import os
 import sqlite3 # Sqlite module is being imported here
 import random
 from faker import Faker
 fake = Faker()
+
+# Absolute paths so these functions work regardless of the caller's working directory
+DB_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(DB_DIR, "company.db")
+SCHEMA_PATH = os.path.join(DB_DIR, "schema.sql")
 
 DEPARTMENTS = [
     ("Sales", "New York"), # Department name paired with City 
@@ -12,10 +18,10 @@ DEPARTMENTS = [
 ]
 
 def build_and_seed_database():
-    conn = sqlite3.connect("database/company.db")
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
 
-    with open("database/schema.sql", "r") as f:
+    with open(SCHEMA_PATH, "r") as f:
         schema_sql = f.read()
 
     cursor.executescript(schema_sql)
@@ -48,7 +54,7 @@ def build_and_seed_database():
 
 def run_sql_query(sql):
     """Executes a SQL query and returns either the results or the error message, as a string."""
-    conn = sqlite3.connect("database/company.db")
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
 
     try:
@@ -62,7 +68,7 @@ def run_sql_query(sql):
         
 def get_schema_description():
     """Returns the schema.sql file content as a string, so it can be shown to the LLM."""
-    with open("database/schema.sql", "r") as f:
+    with open(SCHEMA_PATH, "r") as f:
         return f.read()
         
 if __name__ == "__main__":

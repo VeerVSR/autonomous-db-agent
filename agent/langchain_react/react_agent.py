@@ -2,9 +2,13 @@ import ast
 import io
 import os
 import re
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple, Union
+
 from dotenv import load_dotenv
+from groq import BadRequestError, GroqError
 from langchain_groq import ChatGroq
+import pandas as pd
 
 from agent.langchain_react.prompt import (
     ExcelQueryOutput,
@@ -19,20 +23,45 @@ from agent.langchain_react.prompt import (
     sql_reflection_prompt,
 )
 from database.db_manager import get_schema_description, run_sql_query
-
-import pandas as pd
+from agent.api.llm_config import get_llm
 
 load_dotenv()
 
-DB_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "database"))[cite: 1]
+DB_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "database"))
 
-llm = ChatGroq(model="openai/gpt-oss-120b", temperature=0)
+_CHAIN_CACHE: Dict[str, Dict[str, Any]] = {}
 
-sql_gen_chain = sql_generation_prompt | llm.with_structured_output(SQLQueryOutput)
-sql_reflect_chain = sql_reflection_prompt | llm.with_structured_output(SQLReflectionOutput)
-excel_gen_chain = excel_generation_prompt | llm.with_structured_output(ExcelQueryOutput)
-excel_reflect_chain = excel_reflection_prompt | llm.with_structured_output(ExcelReflectionOutput)
 
+def _get_chains(provider: str) -> Dict[str, Any]:
+    """Builds (and caches) the LLM chains for a given provider ('groq' or 'gemini')
+    so the UI can let the user switch models without restarting the process."""
+    if provider not in _CHAIN_CACHE:
+        provider_llm = get_llm(provider)
+        _CHAIN_CACHE[provider] = {
+            "sql_gen": sql_generation_prompt | provider_llm.with_structured_output(SQLQueryOutput),
+            "sql_reflect": sql_reflection_prompt | provider_llm.with_structured_output(SQLReflectionOutput),
+            "excel_gen": excel_generation_prompt | provider_llm.with_structured_output(ExcelQueryOutput),
+            "excel_reflect": excel_reflection_prompt | provider_llm.with_structured_output(ExcelReflectionOutput),
+        }
+    return _CHAIN_CACHE[provider]
+
+
+def _extract_sql_from_error(exc: Exception) -> Optional[str]:
+    """
+    Groq sometimes rejects a response because the model answered in prose
+    instead of calling the required structured-output tool -- even when that
+    prose contains perfectly correct SQL. Recover it instead of crashing.
+    """
+    text = str(exc)
+    match = re.search(r"```sql\s*(.*?)\s*```", text, re.DOTALL | re.IGNORECASE)
+    if match:
+        sql = match.group(1).strip()
+    else:
+        match = re.search(r"(SELECT\s+.*?;)", text, re.DOTALL | re.IGNORECASE)
+        sql = match.group(1).strip() if match else None
+    if sql:
+        sql = sql.replace("\\n", " ")
+    return sql
 
 def is_safe_pandas_filter(expression: str) -> bool:
     """
@@ -70,11 +99,6 @@ def resolve_data_source(
 
         if safe_name.endswith((".xlsx", ".xls")):
             return "excel", io.BytesIO(uploaded_file.getvalue()), safe_name, "STREAMLIT_UPLOAD"
-        elif safe_name.endswith((".db", ".sqlite")):
-            temp_db = os.path.join(DB_DIR, safe_name)
-            with open(temp_db, "wb") as f:
-                f.write(uploaded_file.getvalue())
-            return "sql", temp_db, safe_name, "STREAMLIT_UPLOAD"
 
     if os.path.exists(DB_DIR):
         excel_files = [f for f in os.listdir(DB_DIR) if f.endswith((".xlsx", ".xls")) and not f.startswith("~$")]
@@ -82,7 +106,7 @@ def resolve_data_source(
             safe_excel = os.path.basename(excel_files[0])
             return "excel", os.path.join(DB_DIR, safe_excel), safe_excel, "LOCAL_REPO"
 
-    return "sql", os.path.join(DB_DIR, "company.db"), "company.db", "LOCAL_REPO"[cite: 1]
+    return "sql", os.path.join(DB_DIR, "company.db"), "company.db", "LOCAL_REPO"
 
 
 def get_excel_metadata(source: Union[str, io.BytesIO]) -> dict:
@@ -130,24 +154,65 @@ def run_excel_query(
 
 def render_xai_tree(xai: Dict[str, Any]) -> str:
     lines = [
-        "┌── [EXPLAINABLE AI TELEMETRY]",
-        f"│   ├── Origin        : {xai['origin']}",
-        f"│   ├── Source        : {xai['source_type']} ({xai['filename']})",
-        f"│   ├── Entity Target : {xai['target_entity']}",
-        f"│   ├── Confidence    : {xai['confidence']}",
-        f"│   ├── Rationale     : {xai['reasoning']}",
+        "+-- [EXPLAINABLE AI TELEMETRY]",
+        f"|   +-- Origin        : {xai['origin']}",
+        f"|   +-- Source        : {xai['source_type']} ({xai['filename']})",
+        f"|   +-- Entity Target : {xai['target_entity']}",
+        f"|   +-- Confidence    : {xai['confidence']}",
+        f"|   +-- Rationale     : {xai['reasoning']}",
     ]
     corrections = xai.get("corrections", [])
     if corrections:
-        lines.append("│   ├── Self-Healing Audit:")
+        lines.append("|   +-- Self-Healing Audit:")
         for fix in corrections:
-            lines.append(f"│   │   ├── Attempt #{fix['attempt']} Error: {fix['error']}")
-            lines.append(f"│   │   ├── Root Cause: {fix['root_cause']}")
-            lines.append(f"│   │   └── Fix Applied: {fix['fix']}")
+            lines.append(f"|   |   +-- Attempt #{fix['attempt']} Error: {fix['error']}")
+            lines.append(f"|   |   +-- Root Cause: {fix['root_cause']}")
+            lines.append(f"|   |   +-- Fix Applied: {fix['fix']}")
     else:
-        lines.append("│   ├── Self-Healing Audit: 0 Retries (Success on attempt 1)")
-    lines.append(f"└── Returned Records  : {xai['rows_returned']} rows")
+        lines.append("|   +-- Self-Healing Audit: 0 Retries (Success on attempt 1)")
+    lines.append(f"+-- Returned Records  : {xai['rows_returned']} rows")
     return "\n".join(lines)
+
+
+def _not_a_sql_question_result(question: str, origin: str, filename: str, note: Optional[str] = None) -> Dict[str, Any]:
+    """Built when the question genuinely isn't answerable with a single SQL query
+    (e.g. 'brief me about the database'), no SQL could be recovered either, or the
+    LLM API call itself failed (bad key, rate limit, connectivity, etc.)."""
+    reasoning = note or "Question is not answerable with a SQL query."
+    default_answer = (
+        "This looks like a question about the database itself rather than its data. "
+        "Try asking something like 'how many employees are in Marketing?'"
+    )
+    return {
+        "question": question,
+        "source_type": "sql",
+        "origin": origin,
+        "filename": filename,
+        "executed_expression": None,
+        "data": None,
+        "xai": {
+            "source_type": "SQL", "origin": origin, "filename": filename,
+            "target_entity": "N/A", "confidence": "N/A",
+            "reasoning": reasoning,
+            "assumptions": [], "corrections": [], "rows_returned": 0,
+        },
+        "xai_visual": f"+-- [EXPLAINABLE AI TELEMETRY]\n+-- Note: {reasoning}",
+        "answer": note or default_answer,
+    }
+
+
+_CHITCHAT = {
+    "thanks", "thank you", "thanks!", "thank you!", "thx", "ty",
+    "hi", "hello", "hey", "hii", "yo",
+    "ok", "okay", "cool", "nice", "great", "good",
+    "bye", "goodbye", "see you", "good morning", "good evening", "good night",
+}
+
+
+def _is_chitchat(question: str) -> bool:
+    """Cheap heuristic so greetings/thanks don't get sent to the LLM as a data question."""
+    normalized = question.strip().lower().strip("!.? ")
+    return normalized in _CHITCHAT
 
 
 def run_agent(
@@ -155,23 +220,56 @@ def run_agent(
     uploaded_file: Optional[Any] = None,
     prefer_upload: bool = True,
     max_retries: int = 2,
+    provider: str = "groq",
 ) -> Dict[str, Any]:
     source_type, source_target, filename, origin = resolve_data_source(uploaded_file, prefer_upload=prefer_upload)
+    chains = _get_chains(provider)
+
+    if _is_chitchat(question):
+        return _not_a_sql_question_result(
+            question, origin, filename,
+            note="That's just a greeting, not a question about the data -- nothing to query.",
+        )
     corrections = []
     res = None
 
     if source_type == "sql":
-        db_path = source_target if isinstance(source_target, str) else os.path.join(DB_DIR, "company.db")[cite: 1]
-        schema = get_schema_description(db_path=db_path)
-        gen: SQLQueryOutput = sql_gen_chain.invoke({"schema": schema, "user_question": question})
+        schema = get_schema_description()
+
+        try:
+            gen: SQLQueryOutput = chains["sql_gen"].invoke({"schema": schema, "user_question": question})
+        except BadRequestError as e:
+            recovered_sql = _extract_sql_from_error(e)
+            if not recovered_sql:
+                return _not_a_sql_question_result(question, origin, filename)
+            gen = SimpleNamespace(
+                sql_query=recovered_sql,
+                reasoning="Recovered SQL from a malformed tool-call response.",
+                assumptions=[],
+            )
+        except GroqError as e:
+            # Auth failures, rate limits, connectivity issues, etc. -- fail gracefully
+            # instead of crashing the whole app with an unhandled traceback.
+            return _not_a_sql_question_result(
+                question, origin, filename,
+                note=f"The language model API call failed: {e}",
+            )
+        except Exception as e:
+            # Provider-agnostic safety net (e.g. Gemini/Google API errors), so a
+            # bad key or quota limit on ANY provider shows a message instead of a crash.
+            return _not_a_sql_question_result(
+                question, origin, filename,
+                note=f"The language model API call failed: {e}",
+            )
+
         current_expr = gen.sql_query
         target_entity = "SQLite Database Tables"
         current_reasoning = gen.reasoning
         assumptions = gen.assumptions
 
         for attempt in range(1, max_retries + 2):
-            res = run_sql_query(current_expr, db_path=db_path)
-            
+            res = run_sql_query(current_expr)
+
             # Robust check handles dict errors, string errors, and raw driver failures
             is_err = (isinstance(res, dict) and "error" in res) or (isinstance(res, str) and "SQL Error" in res)
 
@@ -179,12 +277,29 @@ def run_agent(
                 break
 
             err_msg = res["error"] if isinstance(res, dict) else str(res)
-            fix: SQLReflectionOutput = sql_reflect_chain.invoke({
-                "schema": schema,
-                "user_question": question,
-                "failed_query": current_expr,
-                "error_message": err_msg,
-            })
+
+            try:
+                fix: SQLReflectionOutput = chains["sql_reflect"].invoke({
+                    "schema": schema,
+                    "user_question": question,
+                    "failed_query": current_expr,
+                    "error_message": err_msg,
+                })
+            except BadRequestError as e:
+                recovered_sql = _extract_sql_from_error(e)
+                if not recovered_sql:
+                    # Can't recover a corrected query -- stop retrying, report the last real error.
+                    break
+                fix = SimpleNamespace(
+                    corrected_query=recovered_sql,
+                    error_analysis="N/A (recovered from malformed tool-call response)",
+                    fix_rationale="Recovered corrected SQL from raw model output.",
+                )
+            except (GroqError, Exception):
+                # Auth failures, rate limits, connectivity issues, etc. (any provider) --
+                # stop retrying and report the last real SQL error instead of crashing.
+                break
+
             corrections.append({
                 "attempt": attempt,
                 "error": err_msg,
@@ -196,7 +311,7 @@ def run_agent(
 
     else:
         schema = get_excel_metadata(source_target)
-        gen: ExcelQueryOutput = excel_gen_chain.invoke({"excel_metadata": str(schema), "user_question": question})
+        gen: ExcelQueryOutput = chains["excel_gen"].invoke({"excel_metadata": str(schema), "user_question": question})
         current_expr = gen.filter_expression or "None"
         target_sheet = gen.target_sheet
         target_entity = target_sheet
@@ -215,7 +330,7 @@ def run_agent(
                 break
 
             err_msg = res[0]["error"]
-            fix: ExcelReflectionOutput = excel_reflect_chain.invoke({
+            fix: ExcelReflectionOutput = chains["excel_reflect"].invoke({
                 "excel_metadata": str(schema),
                 "user_question": question,
                 "failed_sheet": target_sheet,
