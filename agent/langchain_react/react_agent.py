@@ -34,16 +34,45 @@ _CHAIN_CACHE: Dict[str, Dict[str, Any]] = {}
 
 def _get_chains(provider: str) -> Dict[str, Any]:
     """Builds (and caches) the LLM chains for a given provider ('groq' or 'gemini')
-    so the UI can let the user switch models without restarting the process."""
-    if provider not in _CHAIN_CACHE:
-        provider_llm = get_llm(provider)
-        _CHAIN_CACHE[provider] = {
+    so the UI can let the user switch models without restarting the process.
+    For Gemini, chains are cached per-API-key so key rotation (see
+    _invoke_with_gemini_rotation) can swap keys without rebuilding everything."""
+    cache_key = (provider, api_key) if provider == "gemini" else provider
+    if cache_key not in _CHAIN_CACHE:
+        provider_llm = get_llm(provider, api_key=api_key)
+        _CHAIN_CACHE[cache_key] = {
             "sql_gen": sql_generation_prompt | provider_llm.with_structured_output(SQLQueryOutput),
             "sql_reflect": sql_reflection_prompt | provider_llm.with_structured_output(SQLReflectionOutput),
             "excel_gen": excel_generation_prompt | provider_llm.with_structured_output(ExcelQueryOutput),
             "excel_reflect": excel_reflection_prompt | provider_llm.with_structured_output(ExcelReflectionOutput),
         }
-    return _CHAIN_CACHE[provider]
+    return _CHAIN_CACHE[cache_key]
+
+def invoke_chain(provider: str, chain_name: str, inputs: Dict[str, Any]) -> Any:
+    """Invokes one of the cached LCEL chains (sql_gen / sql_reflect / excel_gen /
+    excel_reflect). For Gemini, this transparently rotates across every
+    configured GEMINI_API_KEYS entry: if the key currently in use comes back
+    exhausted (429 quota / rate limit), that key is benched and the next one
+    is tried automatically, so a single maxed-out key doesn't take the agent
+    down as long as at least one other key still has quota."""
+    if provider != "gemini":
+        return _get_chains(provider)[chain_name].invoke(inputs)
+
+    pool = get_gemini_pool()
+    last_exc: Optional[Exception] = None
+    for _ in range(pool.key_count()):
+        key = pool.get_key()
+        try:
+            return _get_chains(provider, api_key=key)[chain_name].invoke(inputs)
+        except Exception as e:
+            if is_gemini_quota_error(e):
+                pool.mark_exhausted(key)
+                last_exc = e
+                continue
+            raise
+    # Every key was exhausted -- let the caller's existing error handling
+    # (which already treats LLM-call failures gracefully) take over.
+    raise last_exc
 
 
 def _extract_sql_from_error(exc: Exception) -> Optional[str]:
