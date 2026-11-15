@@ -12,8 +12,8 @@ else:
     print("Database successfully connected!")
     print("Tables in DB:", db.get_usable_table_names())
 
-    # 2. loading our verified Gemnini LLM
-    llm = get_llm("gemini")
+    # 2. loading our verified Gemini LLM
+    llm = get_llm()
 
     # 3. creating a SQL agent of Langachain( with ReAct framework)
     agent_executor = create_sql_agent(llm, db=db, verbose=True)

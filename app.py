@@ -29,11 +29,6 @@ if not os.path.exists(DB_PATH):
     with st.spinner("No database found, building one now..."):
         build_and_seed_database()
 
-MODELS = {
-    "Gemini 3.5 Flash": "gemini",
-    "Groq (openai/gpt-oss-120b)": "groq",
-}
-
 QUICK_PROMPTS = [
     "Show me all tables",
     "List all employees",
@@ -112,7 +107,7 @@ def _push_trace(kind: str, title: str, body: str, color: str) -> None:
     })
 
 
-def _ask(question: str, provider: str) -> None:
+def _ask(question: str) -> None:
     """Runs the agent for one question and records both the chat message and the trace."""
     st.session_state.messages.append({"role": "user", "content": question})
 
@@ -124,7 +119,6 @@ def _ask(question: str, provider: str) -> None:
         result = run_agent(
             question,
             uploaded_file=st.session_state.uploaded_excel,
-            provider=provider,
             max_retries=st.session_state.get("max_retries", 2),
         )
         error = None
@@ -201,8 +195,10 @@ with header_r:
             unsafe_allow_html=True,
         )
     with c2:
-        model_label = st.selectbox("Model", list(MODELS.keys()), label_visibility="collapsed")
-        provider = MODELS[model_label]
+        st.markdown(
+            """<div class="adb-badge"><span class="adb-dot"></span> Model: Gemini 3.5 Flash</div>""",
+            unsafe_allow_html=True,
+        )
 
 tab_chat, tab_schema, tab_playground, tab_settings = st.tabs(
     ["\U0001F4AC Chat", "\U0001F5C3\uFE0F Schema", "\U0001F9EA Playground", "\u2699\uFE0F Settings"]
@@ -279,7 +275,7 @@ with tab_chat:
 
     if question:
         with st.spinner("Thinking..."):
-            _ask(question, provider)
+            _ask(question)
         st.rerun()
 
 # ------------------------------------------------------------------ #
@@ -326,7 +322,7 @@ with tab_playground:
 with tab_settings:
     st.markdown("#### Settings")
     st.write(f"**Database path:** `{DB_PATH}`")
-    st.write(f"**Active model:** {model_label}")
+    st.write("**Active model:** Gemini 3.5 Flash")
     max_retries = st.slider("Self-healing retries", 0, 5, 2)
     st.session_state["max_retries"] = max_retries
 

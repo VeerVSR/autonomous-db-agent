@@ -6,8 +6,6 @@ from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from dotenv import load_dotenv
-from groq import BadRequestError, GroqError
-from langchain_groq import ChatGroq
 import pandas as pd
 
 from agent.langchain_react.prompt import (
@@ -23,47 +21,43 @@ from agent.langchain_react.prompt import (
     sql_reflection_prompt,
 )
 from database.db_manager import get_schema_description, run_sql_query
-from agent.api.llm_config import get_llm
+from agent.api.llm_config import get_llm, get_gemini_pool, is_gemini_quota_error
 
 load_dotenv()
 
 DB_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "database"))
 
-_CHAIN_CACHE: Dict[str, Dict[str, Any]] = {}
+_CHAIN_CACHE: Dict[Optional[str], Dict[str, Any]] = {}
 
 
-def _get_chains(provider: str) -> Dict[str, Any]:
-    """Builds (and caches) the LLM chains for a given provider ('groq' or 'gemini')
-    so the UI can let the user switch models without restarting the process.
-    For Gemini, chains are cached per-API-key so key rotation (see
-    _invoke_with_gemini_rotation) can swap keys without rebuilding everything."""
-    cache_key = (provider, api_key) if provider == "gemini" else provider
-    if cache_key not in _CHAIN_CACHE:
-        provider_llm = get_llm(provider, api_key=api_key)
-        _CHAIN_CACHE[cache_key] = {
-            "sql_gen": sql_generation_prompt | provider_llm.with_structured_output(SQLQueryOutput),
-            "sql_reflect": sql_reflection_prompt | provider_llm.with_structured_output(SQLReflectionOutput),
-            "excel_gen": excel_generation_prompt | provider_llm.with_structured_output(ExcelQueryOutput),
-            "excel_reflect": excel_reflection_prompt | provider_llm.with_structured_output(ExcelReflectionOutput),
+def _get_chains(api_key: Optional[str] = None) -> Dict[str, Any]:
+    """Builds (and caches) the Gemini LLM chains. Chains are cached per-API-key
+    so key rotation (see invoke_chain) can swap keys without rebuilding
+    everything."""
+    if api_key not in _CHAIN_CACHE:
+        llm = get_llm(api_key=api_key)
+        _CHAIN_CACHE[api_key] = {
+            "sql_gen": sql_generation_prompt | llm.with_structured_output(SQLQueryOutput),
+            "sql_reflect": sql_reflection_prompt | llm.with_structured_output(SQLReflectionOutput),
+            "excel_gen": excel_generation_prompt | llm.with_structured_output(ExcelQueryOutput),
+            "excel_reflect": excel_reflection_prompt | llm.with_structured_output(ExcelReflectionOutput),
         }
-    return _CHAIN_CACHE[cache_key]
+    return _CHAIN_CACHE[api_key]
 
-def invoke_chain(provider: str, chain_name: str, inputs: Dict[str, Any]) -> Any:
+
+def invoke_chain(chain_name: str, inputs: Dict[str, Any]) -> Any:
     """Invokes one of the cached LCEL chains (sql_gen / sql_reflect / excel_gen /
-    excel_reflect). For Gemini, this transparently rotates across every
-    configured GEMINI_API_KEYS entry: if the key currently in use comes back
-    exhausted (429 quota / rate limit), that key is benched and the next one
-    is tried automatically, so a single maxed-out key doesn't take the agent
-    down as long as at least one other key still has quota."""
-    if provider != "gemini":
-        return _get_chains(provider)[chain_name].invoke(inputs)
-
+    excel_reflect), transparently rotating across every configured
+    GEMINI_API_KEYS entry: if the key currently in use comes back exhausted
+    (429 quota / rate limit), that key is benched and the next one is tried
+    automatically, so a single maxed-out key doesn't take the agent down as
+    long as at least one other key still has quota."""
     pool = get_gemini_pool()
     last_exc: Optional[Exception] = None
     for _ in range(pool.key_count()):
         key = pool.get_key()
         try:
-            return _get_chains(provider, api_key=key)[chain_name].invoke(inputs)
+            return _get_chains(api_key=key)[chain_name].invoke(inputs)
         except Exception as e:
             if is_gemini_quota_error(e):
                 pool.mark_exhausted(key)
@@ -77,7 +71,7 @@ def invoke_chain(provider: str, chain_name: str, inputs: Dict[str, Any]) -> Any:
 
 def _extract_sql_from_error(exc: Exception) -> Optional[str]:
     """
-    Groq sometimes rejects a response because the model answered in prose
+    Some models occasionally reject a response because they answered in prose
     instead of calling the required structured-output tool -- even when that
     prose contains perfectly correct SQL. Recover it instead of crashing.
     """
@@ -249,10 +243,9 @@ def run_agent(
     uploaded_file: Optional[Any] = None,
     prefer_upload: bool = True,
     max_retries: int = 2,
-    provider: str = "groq",
+    **_ignored: Any,  # accepts and ignores a stray provider= (or anything else) from old callers
 ) -> Dict[str, Any]:
     source_type, source_target, filename, origin = resolve_data_source(uploaded_file, prefer_upload=prefer_upload)
-    chains = _get_chains(provider)
 
     if _is_chitchat(question):
         return _not_a_sql_question_result(
@@ -266,30 +259,23 @@ def run_agent(
         schema = get_schema_description()
 
         try:
-            gen: SQLQueryOutput = chains["sql_gen"].invoke({"schema": schema, "user_question": question})
-        except BadRequestError as e:
-            recovered_sql = _extract_sql_from_error(e)
-            if not recovered_sql:
-                return _not_a_sql_question_result(question, origin, filename)
-            gen = SimpleNamespace(
-                sql_query=recovered_sql,
-                reasoning="Recovered SQL from a malformed tool-call response.",
-                assumptions=[],
-            )
-        except GroqError as e:
-            # Auth failures, rate limits, connectivity issues, etc. -- fail gracefully
-            # instead of crashing the whole app with an unhandled traceback.
-            return _not_a_sql_question_result(
-                question, origin, filename,
-                note=f"The language model API call failed: {e}",
-            )
+            gen: SQLQueryOutput = invoke_chain("sql_gen", {"schema": schema, "user_question": question})
         except Exception as e:
-            # Provider-agnostic safety net (e.g. Gemini/Google API errors), so a
-            # bad key or quota limit on ANY provider shows a message instead of a crash.
-            return _not_a_sql_question_result(
-                question, origin, filename,
-                note=f"The language model API call failed: {e}",
-            )
+            recovered_sql = _extract_sql_from_error(e)
+            if recovered_sql:
+                gen = SimpleNamespace(
+                    sql_query=recovered_sql,
+                    reasoning="Recovered SQL from a malformed tool-call response.",
+                    assumptions=[],
+                )
+            else:
+                # Auth failures, quota exhaustion across every key, connectivity
+                # issues, etc. -- fail gracefully instead of crashing the whole
+                # app with an unhandled traceback.
+                return _not_a_sql_question_result(
+                    question, origin, filename,
+                    note=f"The language model API call failed: {e}",
+                )
 
         current_expr = gen.sql_query
         target_entity = "SQLite Database Tables"
@@ -308,26 +294,23 @@ def run_agent(
             err_msg = res["error"] if isinstance(res, dict) else str(res)
 
             try:
-                fix: SQLReflectionOutput = chains["sql_reflect"].invoke({
+                fix: SQLReflectionOutput = invoke_chain("sql_reflect", {
                     "schema": schema,
                     "user_question": question,
                     "failed_query": current_expr,
                     "error_message": err_msg,
                 })
-            except BadRequestError as e:
+            except Exception as e:
                 recovered_sql = _extract_sql_from_error(e)
                 if not recovered_sql:
-                    # Can't recover a corrected query -- stop retrying, report the last real error.
+                    # Auth failures, quota exhaustion, connectivity issues, etc. --
+                    # stop retrying and report the last real SQL error instead of crashing.
                     break
                 fix = SimpleNamespace(
                     corrected_query=recovered_sql,
                     error_analysis="N/A (recovered from malformed tool-call response)",
                     fix_rationale="Recovered corrected SQL from raw model output.",
                 )
-            except (GroqError, Exception):
-                # Auth failures, rate limits, connectivity issues, etc. (any provider) --
-                # stop retrying and report the last real SQL error instead of crashing.
-                break
 
             corrections.append({
                 "attempt": attempt,
@@ -340,7 +323,7 @@ def run_agent(
 
     else:
         schema = get_excel_metadata(source_target)
-        gen: ExcelQueryOutput = chains["excel_gen"].invoke({"excel_metadata": str(schema), "user_question": question})
+        gen: ExcelQueryOutput = invoke_chain("excel_gen", {"excel_metadata": str(schema), "user_question": question})
         current_expr = gen.filter_expression or "None"
         target_sheet = gen.target_sheet
         target_entity = target_sheet
@@ -359,7 +342,7 @@ def run_agent(
                 break
 
             err_msg = res[0]["error"]
-            fix: ExcelReflectionOutput = chains["excel_reflect"].invoke({
+            fix: ExcelReflectionOutput = invoke_chain("excel_reflect", {
                 "excel_metadata": str(schema),
                 "user_question": question,
                 "failed_sheet": target_sheet,

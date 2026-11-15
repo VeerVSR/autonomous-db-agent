@@ -1,7 +1,10 @@
-import os 
+import itertools
+import os
+import time
+from threading import Lock
+
 from dotenv import load_dotenv
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_groq import ChatGroq
 
 # loading API keys securely from .env file
 load_dotenv()
@@ -98,30 +101,16 @@ def is_gemini_quota_error(exc: Exception) -> bool:
     return "RESOURCE_EXHAUSTED" in text or "429" in text or "QUOTA" in text
 
 
+def get_llm(api_key=None):
+    """The LangChain wrapper of the Gemini API. If api_key isn't given
+    explicitly, pull the next available key from the rotation pool."""
+    key = api_key or get_gemini_pool().get_key()
+    return ChatGoogleGenerativeAI(
+        model="gemini-3.5-flash",
+        temperature=0,
+        api_key=key,
+    )
 
-
-# the following function which i am creating will provide LLM to the langchain agent. provider can be either 'gemini' or 'groq'.
-
-def get_llm(provider="gemini"):
-    if provider == "gemini":
-        # The LangChain wrapper of Gemini API
-        return ChatGoogleGenerativeAI(
-            model="gemini-3.5-flash",
-            temperature=0,
-            api_key=os.getenv("GEMINI_API_KEY")
-
-        )
-    elif provider == "groq":
-        # The LangChain wrapper of Groq API
-        return ChatGroq(
-            model="openai/gpt-oss-120b",
-            temperature=0,
-            api_key=os.getenv("GROQ_API_KEY")
-
-        )
-    else:
-        raise ValueError("Invalid provider. Please choose either 'gemini' or 'groq'.")
-    
 
 def extract_text(response):
     if isinstance(response.content, list):
