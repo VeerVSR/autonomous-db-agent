@@ -69,6 +69,16 @@ def invoke_chain(chain_name: str, inputs: Dict[str, Any]) -> Any:
     raise last_exc
 
 
+def _is_error(res: Any, source_type: str) -> bool:
+    """True if an executor result is an error. SQL errors are 'SQL Error...' strings
+    (a legit row with a column called 'error' must NOT count). Excel errors are a
+    single-element list holding exactly {'error': ...}."""
+    if source_type == "sql":
+        return isinstance(res, str) and res.startswith("SQL Error")
+    return (isinstance(res, list) and len(res) == 1
+            and isinstance(res[0], dict) and set(res[0].keys()) == {"error"})
+
+
 def _extract_sql_from_error(exc: Exception) -> Optional[str]:
     """
     Some models occasionally reject a response because they answered in prose
@@ -101,11 +111,19 @@ def is_safe_pandas_filter(expression: str) -> bool:
             ast.UnaryOp, ast.Name, ast.Constant, ast.Load,
             ast.And, ast.Or, ast.Not,
             ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE,
-            ast.In, ast.NotIn
+            ast.In, ast.NotIn,
+            ast.List, ast.Tuple,                       # City in ['A', 'B']
+            ast.USub, ast.UAdd,                        # negative numbers
+            ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Mod,  # arithmetic (no Pow: DoS risk)
         )
         for node in ast.walk(tree):
             if not isinstance(node, allowed_nodes):
                 return False
+            # Block dunder names (e.g. __class__) and the pandas '@var' escape hatch.
+            if isinstance(node, ast.Name) and node.id.startswith("__"):
+                return False
+        if len(expression) > 500:
+            return False
         return True
     except Exception:
         return False
@@ -197,24 +215,25 @@ def render_xai_tree(xai: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _not_a_sql_question_result(question: str, origin: str, filename: str, note: Optional[str] = None) -> Dict[str, Any]:
+def _not_a_sql_question_result(question: str, origin: str, filename: str, note: Optional[str] = None,
+                               source_type: str = "sql") -> Dict[str, Any]:
     """Built when the question genuinely isn't answerable with a single SQL query
     (e.g. 'brief me about the database'), no SQL could be recovered either, or the
     LLM API call itself failed (bad key, rate limit, connectivity, etc.)."""
     reasoning = note or "Question is not answerable with a SQL query."
     default_answer = (
-        "This looks like a question about the database itself rather than its data. "
+        "This looks like a question about the data source itself rather than its data. "
         "Try asking something like 'how many employees are in Marketing?'"
     )
     return {
         "question": question,
-        "source_type": "sql",
+        "source_type": source_type,
         "origin": origin,
         "filename": filename,
         "executed_expression": None,
         "data": None,
         "xai": {
-            "source_type": "SQL", "origin": origin, "filename": filename,
+            "source_type": source_type.upper(), "origin": origin, "filename": filename,
             "target_entity": "N/A", "confidence": "N/A",
             "reasoning": reasoning,
             "assumptions": [], "corrections": [], "rows_returned": 0,
@@ -285,13 +304,12 @@ def run_agent(
         for attempt in range(1, max_retries + 2):
             res = run_sql_query(current_expr)
 
-            # Robust check handles dict errors, string errors, and raw driver failures
-            is_err = (isinstance(res, dict) and "error" in res) or (isinstance(res, str) and "SQL Error" in res)
+            is_err = _is_error(res, "sql")
 
             if not is_err or attempt > max_retries:
                 break
 
-            err_msg = res["error"] if isinstance(res, dict) else str(res)
+            err_msg = str(res)
 
             try:
                 fix: SQLReflectionOutput = invoke_chain("sql_reflect", {
@@ -323,7 +341,16 @@ def run_agent(
 
     else:
         schema = get_excel_metadata(source_target)
-        gen: ExcelQueryOutput = invoke_chain("excel_gen", {"excel_metadata": str(schema), "user_question": question})
+        if "error" in schema:
+            return _not_a_sql_question_result(
+                question, origin, filename,
+                note=f"Could not read the Excel file: {schema['error']}", source_type="excel")
+        try:
+            gen: ExcelQueryOutput = invoke_chain("excel_gen", {"excel_metadata": str(schema), "user_question": question})
+        except Exception as e:
+            return _not_a_sql_question_result(
+                question, origin, filename,
+                note=f"The language model API call failed: {e}", source_type="excel")
         current_expr = gen.filter_expression or "None"
         target_sheet = gen.target_sheet
         target_entity = target_sheet
@@ -336,20 +363,23 @@ def run_agent(
                 source_target.seek(0)
 
             res = run_excel_query(source_target, target_sheet, current_expr, cols)
-            is_err = isinstance(res, list) and len(res) > 0 and isinstance(res[0], dict) and "error" in res[0]
+            is_err = _is_error(res, "excel")
 
             if not is_err or attempt > max_retries:
                 break
 
             err_msg = res[0]["error"]
-            fix: ExcelReflectionOutput = invoke_chain("excel_reflect", {
-                "excel_metadata": str(schema),
-                "user_question": question,
-                "failed_sheet": target_sheet,
-                "failed_filter": str(current_expr),
-                "failed_columns": str(cols),
-                "error_message": err_msg,
-            })
+            try:
+                fix: ExcelReflectionOutput = invoke_chain("excel_reflect", {
+                    "excel_metadata": str(schema),
+                    "user_question": question,
+                    "failed_sheet": target_sheet,
+                    "failed_filter": str(current_expr),
+                    "failed_columns": str(cols),
+                    "error_message": err_msg,
+                })
+            except Exception:
+                break  # LLM unavailable: report the last real pandas error instead of crashing
 
             corrections.append({
                 "attempt": attempt,
@@ -364,12 +394,8 @@ def run_agent(
             cols = fix.corrected_columns or cols
             current_reasoning = fix.fix_rationale
 
-    has_err = (isinstance(res, dict) and "error" in res) or (
-        isinstance(res, str) and "SQL Error" in res
-    ) or (
-        isinstance(res, list) and len(res) > 0 and isinstance(res[0], dict) and "error" in res[0]
-    )
-    row_count = len(res) if isinstance(res, list) and not has_err else (1 if res and not has_err else 0)
+    has_err = _is_error(res, source_type)
+    row_count = len(res) if isinstance(res, list) and not has_err else 0
 
     if has_err:
         confidence = "Failed"

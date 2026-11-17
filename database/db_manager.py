@@ -1,5 +1,7 @@
 import os
+import re
 import sqlite3 # Sqlite module is being imported here
+import time
 import random
 from faker import Faker
 fake = Faker()
@@ -52,20 +54,57 @@ def build_and_seed_database():
     conn.commit()
     conn.close()
 
-def run_sql_query(sql):
-    """Executes a SQL query and returns either the results or the error message, as a string."""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
+MAX_RESULT_ROWS = 200  # hard cap so a runaway SELECT can't flood the UI / memory
+QUERY_TIMEOUT_SECONDS = 5  # runaway queries (recursive CTEs, giant cross joins) are aborted
 
+_ALLOWED_START = re.compile(r"^\s*(select|with)\b", re.IGNORECASE)
+_STRINGS = re.compile(r"'(?:[^']|'')*'")
+_COMMENTS = re.compile(r"--[^\n]*|/\*.*?\*/", re.DOTALL)
+
+
+def validate_read_only_sql(sql):
+    """Returns None if `sql` is a single read-only SELECT/WITH statement,
+    otherwise a human-readable reason it was rejected. This is defence layer 1;
+    layer 2 is opening SQLite itself in read-only mode (see run_sql_query)."""
+    if not isinstance(sql, str) or not sql.strip():
+        return "Empty query."
+    # Blank out string literals first so ';' or '--' inside 'quoted text' isn't misread.
+    cleaned = _STRINGS.sub("''", sql)
+    cleaned = _COMMENTS.sub(" ", cleaned).strip().rstrip(";").strip()
+    if not _ALLOWED_START.match(cleaned):
+        return "Only read-only SELECT queries are allowed."
+    if ";" in cleaned:
+        return "Multiple statements are not allowed."
+    return None
+
+
+def run_sql_query(sql):
+    """Executes a read-only SQL query.
+    Returns a list of dicts (column name -> value, capped at MAX_RESULT_ROWS),
+    or an error string starting with 'SQL Error'."""
+    reason = validate_read_only_sql(sql)
+    if reason:
+        return f"SQL Error: {reason}"
+
+    # mode=ro: even if validation were bypassed, SQLite refuses every write.
+    conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    deadline = time.monotonic() + QUERY_TIMEOUT_SECONDS
+    # Called every ~10k SQLite VM steps; returning non-zero aborts the query.
+    conn.set_progress_handler(lambda: 1 if time.monotonic() > deadline else 0, 10000)
     try:
+        cursor = conn.cursor()
         cursor.execute(sql)
-        results = cursor.fetchall()
-        return results
+        rows = cursor.fetchmany(MAX_RESULT_ROWS)
+        return [dict(r) for r in rows]
     except sqlite3.Error as e:
+        if "interrupted" in str(e).lower():
+            return f"SQL Error: query exceeded the {QUERY_TIMEOUT_SECONDS}s time limit and was aborted."
         return f"SQL Error: {e}"
     finally:
         conn.close()
-        
+
+
 def get_schema_description():
     """Returns the schema.sql file content as a string, so it can be shown to the LLM."""
     with open(SCHEMA_PATH, "r") as f:

@@ -1,5 +1,6 @@
 import itertools
 import os
+import re
 import time
 from threading import Lock
 
@@ -98,7 +99,13 @@ def is_gemini_quota_error(exc: Exception) -> bool:
     except ImportError:
         pass
     text = str(exc).upper()
-    return "RESOURCE_EXHAUSTED" in text or "429" in text or "QUOTA" in text
+    return (
+        "RESOURCE_EXHAUSTED" in text
+        or bool(re.search(r"\b429\b", text))
+        or "RATE LIMIT" in text 
+        or "QUOTA EXCEEDED" in text
+        or "EXCEEDED YOUR CURRENT QUOTA" in text
+    )
 
 
 def get_llm(api_key=None):
@@ -109,6 +116,8 @@ def get_llm(api_key=None):
         model="gemini-3.5-flash",
         temperature=0,
         api_key=key,
+        max_retries=1, 
+        timeout=30,      
     )
 
 

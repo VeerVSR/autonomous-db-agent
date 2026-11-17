@@ -5,6 +5,7 @@ Run with:
     streamlit run app.py
 """
 
+import html
 import os
 import time
 from datetime import datetime
@@ -12,7 +13,9 @@ from datetime import datetime
 import pandas as pd
 import streamlit as st
 
-from database.db_manager import build_and_seed_database, get_schema_description, DB_PATH
+from database.db_manager import (
+    build_and_seed_database, get_schema_description, run_sql_query, DB_PATH, MAX_RESULT_ROWS,
+)
 from agent.langchain_react.react_agent import run_agent
 
 # ------------------------------------------------------------------ #
@@ -138,8 +141,9 @@ def _ask(question: str) -> None:
     _push_trace("Observation", "Data retrieved" if rows else "No rows / not applicable",
                 f"Query executed. Retrieved {rows} row(s)." if result["executed_expression"] else result["xai"]["reasoning"],
                 "#4ade80")
-    _push_trace("Thought", "Generating final answer",
-                result["xai"]["reasoning"], "#38bdf8")
+    _push_trace("Thought", "Final answer ready",
+                f"Confidence: {result['xai']['confidence']} | {len(result['xai']['corrections'])} self-healing retry(s) | {elapsed:.2f}s",
+                "#38bdf8")
 
     st.session_state.messages.append({
         "role": "assistant", "content": None, "result": result, "elapsed": elapsed, "error": None,
@@ -165,8 +169,8 @@ with st.sidebar:
             <div class="trace-step" style="--dot-color:{step['color']}">
                 <span class="trace-label">{step['kind'].upper()}</span>
                 <span class="trace-time">{step['ts']}</span>
-                <div class="trace-title">{step['title']}</div>
-                <div class="trace-body">{step['body']}</div>
+                <div class="trace-title">{html.escape(str(step['title']))}</div>
+                <div class="trace-body">{html.escape(str(step['body']))}</div>
             </div>
             """,
             unsafe_allow_html=True,
@@ -306,15 +310,13 @@ with tab_playground:
     st.caption("Run a read-only SELECT query directly, bypassing the LLM.")
     raw_sql = st.text_area("SQL query", value="SELECT * FROM Departments;", height=120)
     if st.button("Run query"):
-        from database.db_manager import run_sql_query
-        if not raw_sql.strip().lower().startswith("select"):
-            st.error("Only SELECT queries are allowed here.")
+        out = run_sql_query(raw_sql)  # validates read-only + runs on a read-only connection
+        if isinstance(out, str):
+            st.error(out)
         else:
-            out = run_sql_query(raw_sql)
-            if isinstance(out, str):
-                st.error(out)
-            else:
-                st.dataframe(pd.DataFrame(out), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(out), use_container_width=True, hide_index=True)
+            if len(out) >= MAX_RESULT_ROWS:
+                st.caption(f"Showing the first {MAX_RESULT_ROWS} rows (result cap).")
 
 # ------------------------------------------------------------------ #
 # Settings tab
