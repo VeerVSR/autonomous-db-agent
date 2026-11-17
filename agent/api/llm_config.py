@@ -14,6 +14,23 @@ load_dotenv()
 # exhaustion, before we're willing to try it again.
 GEMINI_KEY_COOLDOWN_SECONDS = int(os.getenv("GEMINI_KEY_COOLDOWN_SECONDS", "60"))
 
+# Ordered fallback list when the primary model returns 503 (high demand)
+DEFAULT_MODELS = [
+    "gemini-3.5-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.7-flash",
+    "gemini-3.6-flash",
+    "gemini-3.8-flash",
+]
+
+
+def _load_models():
+    """Allows overriding fallback order via GEMINI_MODELS in .env if needed."""
+    raw = os.getenv("GEMINI_MODELS", "").strip()
+    if raw:
+        return [m.strip() for m in raw.split(",") if m.strip()]
+    return list(DEFAULT_MODELS)
+
 
 def _load_gemini_keys():
     """Reads GEMINI_API_KEYS (comma-separated) for multi-key rotation.
@@ -43,7 +60,7 @@ class GeminiKeyPool:
                 "GEMINI_API_KEY in your .env file."
             )
         self._keys = keys
-        self._cooldown_until = {k: 0.0 for k in keys}  # key -> unix ts when usable again
+        self._cooldown_until = {k: 0.0 for k in keys}
         self._cycle = itertools.cycle(range(len(keys)))
         self._lock = Lock()
 
@@ -54,9 +71,7 @@ class GeminiKeyPool:
             self._cooldown_until[key] = time.time() + cooldown_seconds
 
     def get_key(self):
-        """Returns the next key that isn't currently benched (round-robin).
-        If every key is benched, returns whichever will free up soonest
-        instead of raising -- the caller still gets to try its luck."""
+        """Returns the next key that isn't currently benched (round-robin)."""
         with self._lock:
             now = time.time()
             for _ in range(len(self._keys)):
@@ -89,9 +104,7 @@ def get_gemini_pool():
 
 
 def is_gemini_quota_error(exc: Exception) -> bool:
-    """True if an exception from the Gemini API means 'this key is out of
-    quota / being rate-limited right now' (as opposed to a real bug, a bad
-    prompt, etc.) -- that's the case we want to rotate keys for."""
+    """True if an exception means 'this key is out of quota / rate-limited'."""
     try:
         from google.genai.errors import ClientError
         if isinstance(exc, ClientError) and getattr(exc, "code", None) in (429, 403):
@@ -102,27 +115,66 @@ def is_gemini_quota_error(exc: Exception) -> bool:
     return (
         "RESOURCE_EXHAUSTED" in text
         or bool(re.search(r"\b429\b", text))
-        or "RATE LIMIT" in text 
+        or "RATE LIMIT" in text
         or "QUOTA EXCEEDED" in text
         or "EXCEEDED YOUR CURRENT QUOTA" in text
     )
 
 
+def _is_model_unavailable_error(exc: Exception) -> bool:
+    """True when the model is overloaded (503) or unavailable (404),
+    so we immediately jump to the next fallback model without freezing."""
+    text = str(exc).upper()
+    return (
+        "503" in text
+        or "UNAVAILABLE" in text
+        or "HIGH DEMAND" in text
+        or "OVERLOADED" in text
+        or "404" in text
+        or "NOT_FOUND" in text
+    )
+
+
+class ResilientChatGoogleGenerativeAI(ChatGoogleGenerativeAI):
+    """Automatically shifts across fallback Gemini models on 503 high-demand
+    errors while preserving LangChain structured outputs and tool calling."""
+
+    fallback_models: list[str] = DEFAULT_MODELS
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        models = self.fallback_models or [self.model]
+        last_exc = None
+        for model_name in models:
+            self.model = model_name
+            try:
+                return super()._generate(
+                    messages, stop=stop, run_manager=run_manager, **kwargs
+                )
+            except Exception as exc:
+                last_exc = exc
+                if _is_model_unavailable_error(exc):
+                    continue
+                raise
+        raise last_exc
+
+
 def get_llm(api_key=None):
-    """The LangChain wrapper of the Gemini API. If api_key isn't given
-    explicitly, pull the next available key from the rotation pool."""
+    """Returns a resilient Gemini LLM wrapper with multi-key rotation and
+    automatic multi-model fallback on 503 server busy errors."""
     key = api_key or get_gemini_pool().get_key()
-    return ChatGoogleGenerativeAI(
-        model="gemini-3.5-flash",
+    models = _load_models()
+    return ResilientChatGoogleGenerativeAI(
+        model=models[0],
+        fallback_models=models,
         temperature=0,
         api_key=key,
-        max_retries=1, 
-        timeout=30,      
+        max_retries=0,
+        timeout=15,
     )
 
 
 def extract_text(response):
     if isinstance(response.content, list):
-        return response.content[0]['text']
+        return response.content[0]["text"]
     else:
         return response.content
